@@ -1,10 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import { trackUsage } from "@/lib/track-usage";
 
+// OpenRouter (API tipo OpenAI). El modelo se cambia con OPENROUTER_MODEL sin tocar código.
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
+const TIMEOUT_MS = 60_000;
+
+type Attachment = { base64?: string; mediaType?: string };
+
+type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "file"; file: { filename: string; file_data: string } };
+
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.OPENROUTER_API_KEY;
 
   if (!apiKey) {
+    console.error("[enhance] Falta OPENROUTER_API_KEY");
     return NextResponse.json(
       { error: "API key not configured" },
       { status: 500 }
@@ -21,75 +34,65 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Build multimodal content array if attachments are provided
-    type ContentBlock =
-      | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
-      | { type: "document"; source: { type: "base64"; media_type: string; data: string } }
-      | { type: "text"; text: string };
+    const imageList: Attachment[] = Array.isArray(images) ? images : [];
+    const docList: Attachment[] = Array.isArray(documents) ? documents : [];
 
-    let userContent: string | ContentBlock[] = message;
+    let userContent: string | ContentPart[] = message;
 
-    const hasImages = images && Array.isArray(images) && images.length > 0;
-    const hasDocs = documents && Array.isArray(documents) && documents.length > 0;
+    if (imageList.length > 0 || docList.length > 0) {
+      const parts: ContentPart[] = [];
 
-    if (hasImages || hasDocs) {
-      const contentBlocks: ContentBlock[] = [];
-
-      // Add image blocks
-      if (hasImages) {
-        for (const img of images) {
-          if (img.base64 && img.mediaType) {
-            contentBlocks.push({
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: img.mediaType,
-                data: img.base64,
-              },
-            });
-          }
+      for (const img of imageList) {
+        if (img.base64 && img.mediaType) {
+          parts.push({
+            type: "image_url",
+            image_url: { url: `data:${img.mediaType};base64,${img.base64}` },
+          });
         }
       }
 
-      // Add document blocks (PDFs)
-      if (hasDocs) {
-        for (const doc of documents) {
-          if (doc.base64 && doc.mediaType) {
-            contentBlocks.push({
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: doc.mediaType,
-                data: doc.base64,
-              },
-            });
-          }
+      docList.forEach((doc, i) => {
+        if (doc.base64 && doc.mediaType) {
+          parts.push({
+            type: "file",
+            file: {
+              filename: `documento-${i + 1}.pdf`,
+              file_data: `data:${doc.mediaType};base64,${doc.base64}`,
+            },
+          });
         }
-      }
+      });
 
-      // Add text message last
-      contentBlocks.push({ type: "text", text: message });
-      userContent = contentBlocks;
+      // El texto va al final, como antes.
+      parts.push({ type: "text", text: message });
+      userContent = parts;
     }
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
+
+    const response = await fetch(OPENROUTER_URL, {
       method: "POST",
+      signal: AbortSignal.timeout(TIMEOUT_MS),
       headers: {
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        ...(hasDocs ? { "anthropic-beta": "pdfs-2024-09-25" } : {}),
+        "HTTP-Referer": "https://inicia-pro-xi.vercel.app",
+        "X-Title": "InicIA Pro",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
+        model,
         max_tokens: 1500,
-        system: system || "",
-        messages: [{ role: "user", content: userContent }],
+        messages: [
+          ...(system ? [{ role: "system", content: system }] : []),
+          { role: "user", content: userContent },
+        ],
       }),
     });
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
+      // Queda en los logs de Vercel para saber qué contestó OpenRouter.
+      console.error("[enhance] OpenRouter respondió", response.status, JSON.stringify(errorData).slice(0, 500));
       return NextResponse.json(
         { error: "API request failed", details: errorData },
         { status: response.status }
@@ -97,18 +100,32 @@ export async function POST(req: NextRequest) {
     }
 
     const data = await response.json();
+    const text: string = data.choices?.[0]?.message?.content ?? "";
 
-    // Fire-and-forget usage tracking
-    if (data.usage) {
-      trackUsage(
-        mode || "Asistente",
-        data.usage.input_tokens,
-        data.usage.output_tokens
+    if (!text) {
+      console.error("[enhance] OpenRouter respondió sin texto", JSON.stringify(data).slice(0, 500));
+      return NextResponse.json(
+        { error: "API request failed" },
+        { status: 502 }
       );
     }
 
-    return NextResponse.json(data);
+    const usage = {
+      input_tokens: data.usage?.prompt_tokens ?? 0,
+      output_tokens: data.usage?.completion_tokens ?? 0,
+    };
+
+    // Fire-and-forget usage tracking
+    trackUsage(mode || "Asistente", usage.input_tokens, usage.output_tokens);
+
+    // Misma forma que la respuesta de Anthropic, para que el frontend no cambie.
+    return NextResponse.json({
+      content: [{ type: "text", text }],
+      usage,
+      model: data.model ?? model,
+    });
   } catch (error) {
+    console.error("[enhance] Error interno", error);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }
